@@ -13,12 +13,13 @@ use anyhow::{anyhow, bail, Context, Result};
 use backoff::backoff::Backoff;
 use backoff::ExponentialBackoff;
 
+use core::fmt;
 use rand::RngCore;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::io::{self, copy_bidirectional, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UdpSocket, UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio::time;
 use tracing::{debug, error, info, info_span, instrument, warn, Instrument, Span};
@@ -544,22 +545,72 @@ impl<T: Transport> ControlChannel<T> {
     }
 }
 
+trait TcpLikeStream: AsyncRead + AsyncWrite + Send + Unpin {}
+impl TcpLikeStream for TcpStream {}
+#[cfg(unix)]
+impl TcpLikeStream for UnixStream {}
+
+enum TcpLikeSocketAddr {
+    Tcp(std::net::SocketAddr),
+    #[cfg(unix)]
+    Unix(tokio::net::unix::SocketAddr),
+}
+
+impl fmt::Display for TcpLikeSocketAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TcpLikeSocketAddr::Tcp(addr) => write!(f, "{:?}", addr),
+            #[cfg(unix)]
+            TcpLikeSocketAddr::Unix(addr) => write!(f, "{:?}", addr),
+        }
+    }
+}
+
+enum TcpLikeListener {
+    Tcp(TcpListener),
+    #[cfg(unix)]
+    Unix(UnixListener),
+}
+
+impl TcpLikeListener {
+    async fn accept(&self) -> io::Result<(Box<dyn TcpLikeStream>, TcpLikeSocketAddr)> {
+        match self {
+            TcpLikeListener::Tcp(l) => {
+                let (s, a) = l.accept().await?;
+                Ok((Box::new(s), TcpLikeSocketAddr::Tcp(a)))
+            }
+            #[cfg(unix)]
+            TcpLikeListener::Unix(l) => {
+                let (s, a) = l.accept().await?;
+                Ok((Box::new(s), TcpLikeSocketAddr::Unix(a)))
+            }
+        }
+    }
+}
+
 fn tcp_listen_and_send(
     addr: String,
     data_ch_req_tx: mpsc::UnboundedSender<bool>,
     mut shutdown_rx: broadcast::Receiver<bool>,
-) -> mpsc::Receiver<TcpStream> {
+) -> mpsc::Receiver<Box<dyn TcpLikeStream>> {
     let (tx, rx) = mpsc::channel(CHAN_SIZE);
 
+    const UNIX_SOCKET_PREFIX: &str = "unix:";
     tokio::spawn(async move {
         let l = retry_notify_with_deadline(listen_backoff(),  || async {
-            Ok(TcpListener::bind(&addr).await?)
+            #[cfg(unix)]
+            {
+                if addr.starts_with(UNIX_SOCKET_PREFIX) {
+                    return Ok(TcpLikeListener::Unix(UnixListener::bind(&addr[UNIX_SOCKET_PREFIX.len()..])?));
+                }
+            }
+            Ok(TcpLikeListener::Tcp(TcpListener::bind(&addr).await?))
         }, |e, duration| {
             error!("{:#}. Retry in {:?}", e, duration);
         }, &mut shutdown_rx).await
         .with_context(|| "Failed to listen for the service");
 
-        let l: TcpListener = match l {
+        let l: TcpLikeListener = match l {
             Ok(v) => v,
             Err(e) => {
                 error!("{:#}", e);
